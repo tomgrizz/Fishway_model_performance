@@ -105,6 +105,20 @@ def compute_model_direction(df: pd.DataFrame, logic: str = "full_transit") -> pd
         result[exited & last_r] = "Downstream"
         return result
 
+    if logic == "direction_with_fallback" and has_dir_col and has_sides:
+        dir_val = df["model_direction"].astype(str).str.strip().str.lower()
+        result  = pd.Series("Unknown", index=df.index)
+        result[dir_val == "left"]  = "Upstream"
+        result[dir_val == "right"] = "Downstream"
+        # For rows where direction field is ambiguous, fall back to exit_side
+        unknown = result == "Unknown"
+        exited = df["exited_frame"].astype(str).str.strip().str.lower() == "true"
+        last_l = df["last_side"].astype(str).str.strip().str.lower() == "left"
+        last_r = df["last_side"].astype(str).str.strip().str.lower() == "right"
+        result[unknown & exited & last_l] = "Upstream"
+        result[unknown & exited & last_r] = "Downstream"
+        return result
+
     if has_dir_col:
         return df["model_direction"].apply(
             lambda v: ("Upstream" if str(v).strip().lower() == "left"
@@ -511,13 +525,15 @@ elif "Time Series" in page:
             show_downstream = st.checkbox("Downstream only (↓)",       value=False, key="ts_dn")
         with dc2:
             has_sides = all(c in model_df.columns for c in ["first_side","last_side","exited_frame"])
-            dir_opts  = (["Full transit — first=Right → last=Left (recommended)",
+            dir_opts  = (["Direction field → exit side fallback (recommended)",
+                          "Full transit — first=Right → last=Left",
                           "Exit side — last_side + exited_frame",
-                          "Direction field — model direction tag"]
-                         if has_sides else ["Direction field — model direction tag"])
+                          "Direction field only"]
+                         if has_sides else ["Direction field only"])
             ts_dir_logic = st.radio("Direction logic", dir_opts, index=0, key="ts_dir_logic")
 
-    dir_mode = ("full_transit" if "Full transit" in ts_dir_logic
+    dir_mode = ("direction_with_fallback" if "fallback" in ts_dir_logic
+                else "full_transit" if "Full transit" in ts_dir_logic
                 else "exit_side" if "Exit side" in ts_dir_logic else "direction_field")
     selected_dirs = list({
         *(["Upstream","Downstream"] if show_dir_split  else []),
@@ -769,6 +785,8 @@ elif "Comparison" in page:
                          color_discrete_map={"Model":"#1976D2","Tech":"#F57C00"},
                          height=max(200*len(sp_sel2)+80,300),
                          labels={"date":"Date","count":"Count","source":"Source"})
+        # Each species facet scales independently
+        fig_cmp.update_yaxes(matches=None, showticklabels=True)
         fig_cmp.update_layout(legend=dict(orientation="h",y=1.02))
         st.plotly_chart(fig_cmp, use_container_width=True)
 
@@ -796,13 +814,15 @@ elif "Comparison" in page:
     has_sides_comp = all(c in model_df.columns for c in ["first_side","last_side","exited_frame"])
     if has_sides_comp:
         dir_logic_comp = st.radio("Model direction logic",
-            ["Full transit — first=Right → last=Left (recommended)",
+            ["Direction field → exit side fallback (recommended)",
+             "Full transit — first=Right → last=Left",
              "Exit side — last_side + exited_frame",
-             "Direction field — model direction tag"],
+             "Direction field only"],
             index=0, key="comp_dir_logic", horizontal=True)
     else:
-        dir_logic_comp = "Direction field — model direction tag"
-    comp_dir_mode = ("full_transit" if "Full transit" in dir_logic_comp
+        dir_logic_comp = "Direction field only"
+    comp_dir_mode = ("direction_with_fallback" if "fallback" in dir_logic_comp
+                     else "full_transit" if "Full transit" in dir_logic_comp
                      else "exit_side" if "Exit side" in dir_logic_comp else "direction_field")
 
     mdf_c = model_df[model_df["model_species"].isin(sp_sel2)].copy()
@@ -869,6 +889,44 @@ elif "Comparison" in page:
         st.dataframe(dir_tbl.style.applymap(_colour_diff, subset=["Diff ↑","Diff ↓","Net diff"]),
                      hide_index=True, use_container_width=True)
         st.caption(f"Blue = model higher · Red = model lower · Logic: **{comp_dir_mode.replace('_',' ')}**")
+
+    st.divider()
+    st.subheader("Direction logic comparison")
+    st.caption("Upstream / downstream totals for every logic mode side-by-side — use this to choose the best counting strategy.")
+
+    _all_logics = [
+        ("Dir field → exit fallback", "direction_with_fallback"),
+        ("Full transit",              "full_transit"),
+        ("Exit side",                 "exit_side"),
+        ("Direction field only",      "direction_field"),
+    ]
+    _sp_comp = sp_sel2  # use the species already selected above
+
+    # Tech totals (same regardless of model logic)
+    _tdf_cmp = tech_df[(tech_df["false_trigger"]==0) & tech_df["species"].isin(_sp_comp)].copy()
+    _tdf_cmp["direction"] = _tdf_cmp["direction"].apply(norm_direction)
+    def _tech_tot(sp, direction):
+        sub = _tdf_cmp[(_tdf_cmp["species"]==sp) & (_tdf_cmp["direction"]==direction)]
+        return int(sub["count"].sum()) if not sub.empty else 0
+
+    logic_rows = []
+    for sp in _sp_comp:
+        row = {"Species": sp}
+        for label, mode in _all_logics:
+            _mdf_tmp = model_df[model_df["model_species"]==sp].copy()
+            _mdf_tmp["_dir"] = compute_model_direction(_mdf_tmp, mode)
+            up = int((_mdf_tmp["_dir"]=="Upstream").sum())
+            dn = int((_mdf_tmp["_dir"]=="Downstream").sum())
+            row[f"{label} ↑"] = up
+            row[f"{label} ↓"] = dn
+        row["Tech ↑"] = _tech_tot(sp, "Upstream")
+        row["Tech ↓"] = _tech_tot(sp, "Downstream")
+        logic_rows.append(row)
+
+    logic_tbl = pd.DataFrame(logic_rows)
+    logic_tbl = logic_tbl[logic_tbl[["Tech ↑","Tech ↓"]].sum(axis=1) > 0]
+    if not logic_tbl.empty:
+        st.dataframe(logic_tbl, hide_index=True, use_container_width=True)
 
 
 # ===========================================================================
@@ -1050,6 +1108,22 @@ elif "Metrics" in page:
     st.plotly_chart(chart_confusion_matrix(matched, species_thresholds, normalize), use_container_width=True)
     st.caption("Rows = actual (tech) · Columns = model predictions · "
                "'No detection' = no model hit or below confidence threshold (excluded — sent for review).")
+
+    # Flagged-for-review count
+    _all_fish_m = matched[(matched["false_trigger"]==0) & matched["species"].isin(SPECIES_FISH)].copy()
+    _all_fish_m["top_score"] = pd.to_numeric(_all_fish_m["top_score"], errors="coerce").fillna(0)
+    _flagged = _all_fish_m[
+        _all_fish_m["model_species"].apply(lambda sp: isinstance(sp, str)) &
+        _all_fish_m.apply(lambda r: r["top_score"] < species_thresholds.get(r["model_species"], default_thresh), axis=1)
+    ]
+    _total_det = int(_all_fish_m["model_species"].notna().sum())
+    _flagged_n  = len(_flagged)
+    st.info(
+        f"At the current threshold, **{_flagged_n:,}** of {_total_det:,} matched detections "
+        f"({100*_flagged_n/_total_det:.1f}% of model hits) would be flagged for manual review and are "
+        f"excluded from the matrix above."
+        if _total_det > 0 else "No matched detections found."
+    )
 
     st.divider()
     st.subheader("Precision–Recall Curves")
