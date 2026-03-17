@@ -211,9 +211,10 @@ def _eval_df(matched: pd.DataFrame, species_thresholds: dict) -> pd.DataFrame:
         thresh = species_thresholds.get(sp, 0.5)
         if row["top_score"] >= thresh:
             return sp
-        return "Flagged for Review"
+        return None  # below threshold — exclude from metrics (will be reviewed manually)
 
     df["pred"] = df.apply(_pred, axis=1)
+    df = df[df["pred"].notna()]  # drop flagged-for-review rows from metric calculations
     return df
 
 
@@ -222,7 +223,7 @@ def chart_confusion_matrix(matched: pd.DataFrame, species_thresholds: dict,
     df = _eval_df(matched, species_thresholds)
     if df.empty:
         return go.Figure()
-    labels   = SPECIES_FISH + ["Flagged for Review", "No detection"]
+    labels   = SPECIES_FISH + ["No detection"]
     cm       = confusion_matrix(df["species"], df["pred"], labels=labels,
                                 normalize=normalize if normalize != "none" else None)
     cm_counts = confusion_matrix(df["species"], df["pred"], labels=labels)
@@ -334,7 +335,7 @@ def chart_class_scores(row: pd.Series) -> go.Figure:
 # Session state
 # ---------------------------------------------------------------------------
 def _init():
-    defaults = {"conf_thresh": 0.5, "page": "📊 Overview"}
+    defaults = {"conf_thresh": 0.5, "page": "Overview"}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -380,23 +381,23 @@ if not tech_df.empty:
 # SIDEBAR
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("🐟 Model Performance")
+    st.title("Model Performance")
     st.caption("Credit River · 2025 Season")
 
     st.divider()
     st.session_state.conf_thresh = st.slider(
         "Confidence threshold", 0.1, 0.9,
         float(st.session_state.conf_thresh), 0.05,
-        help="Detections below this score are flagged as struggling / sent for review",
+        help="Detections below this score are excluded from metrics and flagged for review",
     )
 
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
-    _pages = ["📊 Overview", "📈 Time Series", "⚖️ Comparison",
-              "🎬 Struggling Videos", "📉 Distributions", "📐 Metrics"]
+    _pages = ["Overview", "Time Series", "Comparison",
+              "Struggling Videos", "Distributions", "Metrics"]
     page = st.radio(
         "Page", _pages,
         index=_pages.index(st.session_state.page) if st.session_state.page in _pages else 0,
@@ -414,13 +415,23 @@ with st.sidebar:
 # PAGE: OVERVIEW
 # ===========================================================================
 if "Overview" in page:
-    st.header("📊 Overview")
+    st.header("Overview")
+
+    conf = float(st.session_state.conf_thresh)
+    # Filter model detections to those at or above the confidence threshold
+    if "top_score" in model_df.columns:
+        model_df_thresh = model_df[
+            pd.to_numeric(model_df["top_score"], errors="coerce").fillna(0) >= conf
+        ]
+    else:
+        model_df_thresh = model_df
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Model detections", f"{len(model_df):,}")
+    c1.metric("Model detections", f"{len(model_df_thresh):,}",
+              help=f"Detections above {conf:.2f} confidence threshold")
     tech_fish = int(tech_df.loc[tech_df["species"].isin(SPECIES_FISH),"count"].sum())
     c2.metric("Tech fish counts", f"{tech_fish:,}")
-    c3.metric("Unique clips", f"{model_df['clip_folder'].nunique():,}" if "clip_folder" in model_df.columns else "—")
+    c3.metric("Unique clips", f"{model_df_thresh['clip_folder'].nunique():,}" if "clip_folder" in model_df_thresh.columns else "—")
     c4.metric("Matched events", f"{len(matched):,}" if not matched.empty else "—")
     c5.metric("Struggling events", f"{len(struggle):,}" if not struggle.empty else "—")
 
@@ -428,7 +439,7 @@ if "Overview" in page:
     pie1, pie2 = st.columns(2)
     with pie1:
         st.subheader("Model — species distribution")
-        sp_c = model_df[model_df["model_species"].isin(SPECIES_FISH)]["model_species"].value_counts().reset_index()
+        sp_c = model_df_thresh[model_df_thresh["model_species"].isin(SPECIES_FISH)]["model_species"].value_counts().reset_index()
         sp_c.columns = ["Species","Count"]
         fig = px.pie(sp_c, values="Count", names="Species", color="Species",
                      color_discrete_map=SPECIES_COLORS, hole=0.4)
@@ -449,6 +460,8 @@ if "Overview" in page:
         st.subheader("Species accuracy (direct-matched events)")
         ev = matched[(matched["false_trigger"]==0) & matched["model_species"].notna()
                      & matched["species"].isin(SPECIES_FISH)]
+        # Exclude below-threshold detections from accuracy (they go for manual review)
+        ev = ev[pd.to_numeric(ev["top_score"], errors="coerce").fillna(0) >= conf]
         if not ev.empty:
             correct = (ev["model_species"] == ev["species"]).sum()
             total   = len(ev)
@@ -477,7 +490,7 @@ if "Overview" in page:
 # PAGE: TIME SERIES
 # ===========================================================================
 elif "Time Series" in page:
-    st.header("📈 Species Counts Through Time")
+    st.header("Species Counts Through Time")
 
     sp_sel = st.multiselect("Species", SPECIES_FISH, default=SPECIES_FISH)
     ctrl1, ctrl2 = st.columns(2)
@@ -598,7 +611,7 @@ elif "Time Series" in page:
                         line=dict(color=color,width=1.5,dash="dashdot"),mode="lines+markers",
                         marker=dict(size=6,symbol="diamond"),legendgroup=f"{sp}_{direction}"))
         if n_unknown_dir > 0:
-            st.caption(f"ℹ {n_unknown_dir:,} model detections had no determinable direction "
+            st.caption(f"{n_unknown_dir:,} model detections had no determinable direction "
                        f"({dir_mode} logic) and are excluded from ↑/↓ traces but included in totals.")
 
     fig.update_layout(title="Species counts: Model (solid) vs Technician (dashed)",
@@ -611,7 +624,7 @@ elif "Time Series" in page:
     # ── Cumulative counts ─────────────────────────────────────────────────────
     st.divider()
     st.subheader("Cumulative counts over time")
-    cum_tab1, cum_tab2 = st.tabs(["📈 Total cumulative", "🔀 Net upstream migration (↑ − ↓)"])
+    cum_tab1, cum_tab2 = st.tabs(["Total cumulative", "Net upstream migration (↑ − ↓)"])
 
     with cum_tab1:
         fig_cum = go.Figure()
@@ -730,7 +743,7 @@ elif "Time Series" in page:
 # PAGE: COMPARISON
 # ===========================================================================
 elif "Comparison" in page:
-    st.header("⚖️ Model vs Technician Comparison")
+    st.header("Model vs Technician Comparison")
 
     sp_sel2 = st.multiselect("Species", SPECIES_FISH, default=SPECIES_FISH, key="comp_sp")
     gran2   = st.radio("Granularity", ["Daily","Weekly"], horizontal=True, key="comp_gran")
@@ -862,7 +875,7 @@ elif "Comparison" in page:
 # PAGE: STRUGGLING VIDEOS
 # ===========================================================================
 elif "Struggling" in page:
-    st.header("🎬 Struggling Videos")
+    st.header("Struggling Videos")
 
     if struggle.empty:
         if matched.empty:
@@ -923,7 +936,7 @@ elif "Struggling" in page:
 
     with right:
         if not selected:
-            st.info("👈 Select an event from the list to view details.")
+            st.info("Select an event from the list to view details.")
         else:
             row = event_list.iloc[selected[0]]
             st.subheader(f"Event {row.get('event_id','?')}  ·  "
@@ -952,7 +965,7 @@ elif "Struggling" in page:
 # PAGE: DISTRIBUTIONS
 # ===========================================================================
 elif "Distributions" in page:
-    st.header("📉 Distributions & Statistics")
+    st.header("Distributions & Statistics")
 
     sp_sel3 = st.multiselect("Species", SPECIES_FISH, default=SPECIES_FISH, key="dist_sp")
 
@@ -1003,7 +1016,7 @@ elif "Distributions" in page:
 # PAGE: METRICS
 # ===========================================================================
 elif "Metrics" in page:
-    st.header("📐 Classification Metrics")
+    st.header("Classification Metrics")
 
     if matched.empty:
         st.info("No directly-matched events found. Requires fish-counter tech files with a `video_rel` column.")
@@ -1036,7 +1049,7 @@ elif "Metrics" in page:
     st.subheader("Confusion Matrix")
     st.plotly_chart(chart_confusion_matrix(matched, species_thresholds, normalize), use_container_width=True)
     st.caption("Rows = actual (tech) · Columns = model predictions · "
-               "'Flagged for Review' = detected but below threshold · 'No detection' = no model hit.")
+               "'No detection' = no model hit or below confidence threshold (excluded — sent for review).")
 
     st.divider()
     st.subheader("Precision–Recall Curves")
